@@ -1,0 +1,53 @@
+# Build
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+*.cbp
+
+# Compiled artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.air
+*.metallib
+*.metallibsym
+
+# Models / weights
+*.ssm
+*.bin
+*.safetensors
+*.pt
+*.pth
+models/
+weights/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+pip-wheel-metadata/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
