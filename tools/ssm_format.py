@@ -55,7 +55,10 @@ Fixed 96 bytes. Always at file offset 0. Little-endian.
     n_groups         u32         4      Mamba-2 SSD group count for B/C
                                         broadcasting. 0 in old files is
                                         backward-compat decoded as 1.
-    reserved         u32[5]      20     zeroed; pads header to 96 B
+    norm_before_gate u32         4      0 = standard Mamba-2 gate-then-norm
+                                        1 = Codestral norm-then-gate. Default
+                                        for older files: 0.
+    reserved         u32[4]      16     zeroed; pads header to 96 B
 
 TensorIndexEntry
 ----------------
@@ -136,7 +139,7 @@ def packed_nbytes(dtype: int, numel: int) -> int:
     return numel * DTYPE_ITEMSIZE[dtype]
 
 # struct format strings (little-endian)
-HEADER_STRUCT = "<4s I I I Q Q I I I I I I I I I I 6I"
+HEADER_STRUCT = "<4s I I I Q Q I I I I I I I I I I I 5I"
 HEADER_SIZE = struct.calcsize(HEADER_STRUCT)
 assert HEADER_SIZE == 96, f"FileHeader must be 96 bytes, got {HEADER_SIZE}"
 
@@ -161,6 +164,7 @@ class Mamba2Hparams:
     d_head: int
     chunk_size: int = 256
     n_groups: int = 1
+    norm_before_gate: int = 0     # 0 = gate-then-norm, 1 = norm-then-gate (Codestral)
     default_dtype: int = DTYPE_F16
 
 
@@ -209,8 +213,9 @@ def pack_header(h: Mamba2Hparams, n_tensors: int, index_offset: int, data_offset
         h.d_head,
         h.chunk_size,
         h.default_dtype,
-        h.n_groups,       # repurposed reserved[0]
-        0, 0, 0, 0, 0,
+        h.n_groups,             # repurposed reserved[0] in Phase 11
+        h.norm_before_gate,     # repurposed reserved[1] in Phase 16
+        0, 0, 0, 0,
     )
 
 
@@ -222,7 +227,7 @@ def unpack_header(buf: bytes) -> Tuple[Mamba2Hparams, dict]:
     (magic, version, hsize, n_tensors, idx_off, data_off,
      d_model, n_layer, d_state, d_conv, expand, vocab_size,
      n_heads, d_head, chunk_size, default_dtype,
-     n_groups, _r1, _r2, _r3, _r4, _r5) = fields
+     n_groups, norm_before_gate, _r2, _r3, _r4, _r5) = fields
     if n_groups == 0:
         # Backward compat: pre-Phase-11 exporters wrote zero here.
         n_groups = 1
@@ -235,7 +240,9 @@ def unpack_header(buf: bytes) -> Tuple[Mamba2Hparams, dict]:
     hp = Mamba2Hparams(
         d_model=d_model, n_layer=n_layer, d_state=d_state, d_conv=d_conv,
         expand=expand, vocab_size=vocab_size, n_heads=n_heads, d_head=d_head,
-        chunk_size=chunk_size, n_groups=n_groups, default_dtype=default_dtype,
+        chunk_size=chunk_size, n_groups=n_groups,
+        norm_before_gate=norm_before_gate,
+        default_dtype=default_dtype,
     )
     meta = dict(version=version, n_tensors=n_tensors,
                 index_offset=idx_off, data_offset=data_off)

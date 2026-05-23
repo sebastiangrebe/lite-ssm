@@ -127,6 +127,7 @@ def hparams_from_config(cfg) -> fmt.Mamba2Hparams:
     d_head     = _get(cfg, "head_dim", "d_head")
     chunk_size = _get(cfg, "chunk_size", default=256)
     n_groups   = _get(cfg, "n_groups", "num_groups", "ssm_n_groups", default=1)
+    norm_before_gate = bool(_get(cfg, "norm_before_gate", default=False))
 
     # Derive heads/d_head if absent: in Mamba-2, d_inner = expand * d_model = n_heads * d_head.
     if n_heads is None and d_head is not None:
@@ -152,6 +153,7 @@ def hparams_from_config(cfg) -> fmt.Mamba2Hparams:
         d_head=int(d_head),
         chunk_size=int(chunk_size),
         n_groups=int(n_groups),
+        norm_before_gate=1 if norm_before_gate else 0,
         default_dtype=fmt.DTYPE_F16,
     )
 

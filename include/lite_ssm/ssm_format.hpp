@@ -95,7 +95,11 @@ struct FileHeader {
     // (pre-Phase 11) wrote zero here; the loader treats zero as 1 so the
     // .ssm format remains backward-compatible at version=1.
     uint32_t n_groups;
-    uint32_t reserved[5];       // zeroed; pads header to 96 B so the first
+    // Phase 16: norm_before_gate. 0 = standard Mamba-2 (gate-then-norm),
+    // 1 = Codestral's inverted order (norm-then-gate). Old files default
+    // to 0 → backward-compatible.
+    uint32_t norm_before_gate;
+    uint32_t reserved[4];       // zeroed; pads header to 96 B so the first
                                 // index entry's u64 fields land 8-aligned
 };
 

@@ -24,6 +24,32 @@ struct Conv1dParams {
     uint K;       // kernel width (d_conv, usually 4)
 };
 
+// Phase 16: seed the conv-state rolling window from the last K timesteps
+// of pre-conv xBC. Keeps the prefill -> decode handoff entirely on-GPU,
+// so we don't need a CPU memcpy between layers and can batch all 64 layers
+// of forward_prefill into a single MTLCommandBuffer.
+//
+//   state[d, k] = (L - K + k) >= 0 ? xBC[L - K + k, d] : 0
+//
+// Layout: state is (B=1, D, K) row-major, K-contiguous. Grid: (D, K).
+kernel void seed_conv_state_f16(
+    device const half* xBC    [[ buffer(0) ]],    // (L, D)
+    device       half* state  [[ buffer(1) ]],    // (B=1, D, K)
+    constant Conv1dParams& p  [[ buffer(2) ]],
+    uint2 gid                 [[ thread_position_in_grid ]]
+) {
+    const uint d = gid.x;
+    const uint k = gid.y;
+    if (d >= p.D || k >= p.K) return;
+
+    const int src_t = int(p.L) - int(p.K) + int(k);
+    half v = half(0);
+    if (src_t >= 0) {
+        v = xBC[uint(src_t) * p.D + d];
+    }
+    state[d * p.K + k] = v;
+}
+
 // ---------------------------------------------------------------------------
 //  Prefill: full causal conv over the whole sequence.
 //

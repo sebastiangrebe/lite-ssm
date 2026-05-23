@@ -29,8 +29,10 @@ struct Mamba2Config {
     uint32_t n_heads       = 0;
     uint32_t d_head        = 0;
     uint32_t chunk_size    = 0;
-    uint32_t n_groups      = 1;   // Phase 11 — B/C broadcast width
-    DType    default_dtype = DTYPE_F16;
+    uint32_t n_groups          = 1;   // Phase 11 — B/C broadcast width
+    bool     norm_before_gate  = false;  // Phase 16 — Codestral inverts the
+                                         // standard Mamba-2 gate/norm order.
+    DType    default_dtype     = DTYPE_F16;
 };
 
 class SSMFile {

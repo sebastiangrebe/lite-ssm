@@ -185,8 +185,15 @@ void Mamba2Model::run_block(MetalOps& ops,
                          WS, wsl.ssd_y_off,
                          dims);
     } else {
+        // Phase 17 — the rewritten ssd_chunked_f16 stages a (CK × CK) M
+        // matrix in threadgroup memory, which forces a hard cap on the
+        // runtime chunk size. The config's `chunk_size` (256 for HF Mamba-2)
+        // stays in the .ssm header for forward-compat; longer prefills
+        // just iterate over more 64-token sub-chunks inside one kernel
+        // launch (math unchanged).
+        constexpr uint32_t SSD_KERNEL_MAX_CHUNK = 64;
         SSDDims dims{L, n_heads, d_head, d_state, n_groups,
-                     std::min<uint32_t>(cfg.chunk_size, L),
+                     std::min<uint32_t>({cfg.chunk_size, L, SSD_KERNEL_MAX_CHUNK}),
                      DT_MIN, DT_MAX, /*has_D*/1u};
         ops.ssd_chunked_f16(WS, wsl.ssd_x_off,
                             WS, wsl.ssd_B_off,
@@ -201,49 +208,52 @@ void Mamba2Model::run_block(MetalOps& ops,
     }
 
     // ------------------------------------------------------------------
-    // 6. gated mixer output (HF order: GATE THEN NORM):
-    //    gated = ssd_y * silu(z)
-    //    HF's Mamba2RMSNormGated does `y = y * silu(gate); y = rmsnorm(y, w)`.
-    //    silu_gated_f16(x, gate) computes silu(x) * gate, so pass x=z, gate=y.
+    // 6+7. Mamba2RMSNormGated — gate THEN norm.
+    //
+    // Phase 16 audit finding: HF's `MambaRMSNormGated.forward` hardcodes
+    // gate-then-norm regardless of the `config.norm_before_gate` flag —
+    // the flag is only honored on the fused training path. So our default
+    // (gate-then-norm) is the right thing for BOTH 130M (parity passes)
+    // and Codestral (HF's runtime ignores its own norm_before_gate=True
+    // config). We still parse the flag for forward-compat with future
+    // Mamba2 variants that might respect it, but don't branch on it.
     // ------------------------------------------------------------------
+    (void)cfg.norm_before_gate;
     ops.silu_gated_f16(WS, wsl.proj_z_off,
                        WS, wsl.ssd_y_off,
                        WS, wsl.gated_off,
                        L * d_inner);
-
-    // ------------------------------------------------------------------
-    // 7. mixer RMSNorm(gated) -> ssd_normed
-    // ------------------------------------------------------------------
     ops.rmsnorm_f16(WS, wsl.gated_off,
                     W,  bw.mixer_norm_w.offset_bytes,
                     WS, wsl.ssd_normed_off,
                     {L, d_inner, RMS_EPS});
+    const std::size_t mixer_out_off = wsl.ssd_normed_off;
 
     // ------------------------------------------------------------------
-    // 8. out_proj: block_out = ssd_normed @ W_out_proj.T  (FP16 or INT4)
+    // 8. out_proj: block_out = mixer_out @ W_out_proj.T  (FP16 or INT4)
     // ------------------------------------------------------------------
     if (bw.out_proj_w.dtype == DTYPE_INT4_B32) {
         const uint32_t op_N = d_model, op_K = d_inner;
         const std::size_t pack_off = bw.out_proj_w.offset_bytes;
         const std::size_t scale_off = pack_off + std::size_t(op_N) * (op_K / 2);
         if (decode || L == 1) {
-            ops.linear_int4_gemv(WS, wsl.ssd_normed_off,
+            ops.linear_int4_gemv(WS, mixer_out_off,
                                  W, pack_off, W, scale_off,
                                  WS, wsl.block_out_off,
                                  {1u, op_N, op_K});
         } else {
-            ops.linear_int4_gemm(WS, wsl.ssd_normed_off,
+            ops.linear_int4_gemm(WS, mixer_out_off,
                                  W, pack_off, W, scale_off,
                                  WS, wsl.block_out_off,
                                  {L, op_N, op_K});
         }
     } else if (decode || L == 1) {
-        ops.linear_f16_gemv(WS, wsl.ssd_normed_off,
+        ops.linear_f16_gemv(WS, mixer_out_off,
                             W,  bw.out_proj_w.offset_bytes,
                             WS, wsl.block_out_off,
                             {1u, d_model, d_inner});
     } else {
-        ops.linear_f16_gemm(WS, wsl.ssd_normed_off,
+        ops.linear_f16_gemm(WS, mixer_out_off,
                             W,  bw.out_proj_w.offset_bytes,
                             WS, wsl.block_out_off,
                             {L, d_model, d_inner});
@@ -255,59 +265,24 @@ void Mamba2Model::run_block(MetalOps& ops,
     ops.add_inplace_f16(WS, wsl.hidden_off,
                         WS, wsl.block_out_off,
                         L * d_model);
+
+    // ------------------------------------------------------------------
+    // 10. Phase 16 — seed conv state from pre-conv xBC for the next decode
+    //     step. This is now an in-batch kernel rather than a CPU memcpy,
+    //     so forward_prefill commits all 64 layers in ONE command buffer.
+    //     Skipped for the decode path (causal_conv1d_update_f16 advances
+    //     the window in place).
+    // ------------------------------------------------------------------
+    if (!decode && L >= 1) {
+        ops.seed_conv_state_f16(WS, wsl.proj_xBC_off,
+                                ST, state.conv_state_offset(layer_idx),
+                                L, xBC_dim, d_conv);
+    }
 }
 
 // ---------------------------------------------------------------------------
 //  Top-level forward drivers
 // ---------------------------------------------------------------------------
-
-namespace {
-
-// CPU helper: after a prefill kernel batch has been committed and waited on,
-// seed each layer's conv_state with the LAST d_conv pre-conv xBC samples.
-// Required so the next decode step's causal_conv1d_update_f16 sees the right
-// window of past samples.
-void seed_conv_state_from_prefill(Mamba2Workspace& ws,
-                                  Mamba2State& state,
-                                  const Mamba2Config& cfg,
-                                  uint32_t layer_idx,
-                                  uint32_t L) {
-    // The block forward overwrites proj_xBC for every layer — so we must
-    // call this RIGHT AFTER that layer's prefill, before the next layer
-    // clobbers it. We work around the encoder batching by doing this
-    // outside the batch (callers split the batch per layer for the seed
-    // pass — see forward_prefill below).
-    const uint32_t d_inner = cfg.expand * cfg.d_model;
-    const uint32_t d_state = cfg.d_state;
-    const uint32_t d_conv  = cfg.d_conv;
-    const uint32_t xBC_dim = d_inner + 2 * d_state;
-
-    const auto& wsl = ws.layout();
-    const auto* xBC_base = static_cast<const std::uint8_t*>(ws.contents())
-                         + wsl.proj_xBC_off;
-
-    auto* state_base = static_cast<std::uint8_t*>(state.contents())
-                     + state.conv_state_offset(layer_idx);
-
-    // Conv state layout per layer: (B=1, xBC_dim, d_conv) fp16, row-major
-    // where row stride = d_conv * 2. Element [d, k] lives at d*d_conv + k.
-    // We seed state[d, k] = xBC[L - d_conv + k, d]  for k in [0, d_conv)
-    // (the last d_conv timesteps' samples for channel d).
-    for (uint32_t d = 0; d < xBC_dim; ++d) {
-        for (uint32_t k = 0; k < d_conv; ++k) {
-            const int32_t src_t = static_cast<int32_t>(L) - static_cast<int32_t>(d_conv) + k;
-            std::uint16_t val_h = 0;
-            if (src_t >= 0) {
-                const auto* row = xBC_base + std::size_t(src_t) * xBC_dim * 2;
-                std::memcpy(&val_h, row + d * 2, 2);
-            }
-            auto* slot = state_base + (std::size_t(d) * d_conv + k) * 2;
-            std::memcpy(slot, &val_h, 2);
-        }
-    }
-}
-
-}  // namespace
 
 void Mamba2Model::forward_prefill(MetalOps& ops,
                                   Mamba2Workspace& ws,
@@ -318,17 +293,16 @@ void Mamba2Model::forward_prefill(MetalOps& ops,
         throw std::invalid_argument("forward_prefill: L exceeds workspace max_seq_len");
     }
 
-    // Per layer we need to seed the conv_state CPU-side between layers (the
-    // workspace's proj_xBC slot is overwritten by the next layer). So the
-    // simplest correct path is to commit + wait per layer, then seed.
-    // This negates some of the batching win but only inside the prefill
-    // phase — decode steps still batch the whole forward into one buffer.
+    // Phase 16: conv state is now seeded by an in-kernel `seed_conv_state_f16`
+    // call inside run_block, so the whole prefill batches into ONE command
+    // buffer. Prior code committed + waited per layer (64 round-trips on
+    // Codestral 7B) to do the seed CPU-side; that overhead was the dominant
+    // cost of short prefills.
+    ops.begin_batch();
     for (uint32_t i = 0; i < cfg_.n_layer; ++i) {
-        ops.begin_batch();
         run_block(ops, ws, state, /*layer_idx*/ i, L, /*decode*/ false);
-        ops.commit_and_wait();
-        seed_conv_state_from_prefill(ws, state, cfg_, i, L);
     }
+    ops.commit_and_wait();
 }
 
 void Mamba2Model::forward_step(MetalOps& ops,

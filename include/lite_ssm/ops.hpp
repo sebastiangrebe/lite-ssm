@@ -180,6 +180,13 @@ public:
                                   MetalBufferHandle y,     std::size_t y_off,
                                   Conv1dDims dims);
 
+    // Phase 16: seed (B=1, D, K) conv-state from the last K timesteps of
+    // pre-conv xBC. Runs inside the same command buffer as the prefill —
+    // eliminates the per-layer commit_and_wait the CPU-side seeder needed.
+    void seed_conv_state_f16(MetalBufferHandle xBC,   std::size_t xBC_off,
+                             MetalBufferHandle state, std::size_t state_off,
+                             uint32_t L, uint32_t D, uint32_t K);
+
     void ssd_chunked_f16(MetalBufferHandle X,        std::size_t X_off,
                          MetalBufferHandle B,        std::size_t B_off,
                          MetalBufferHandle C,        std::size_t C_off,

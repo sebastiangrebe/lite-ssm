@@ -36,9 +36,10 @@ Mamba2Config config_from_header(const FileHeader& h) {
     c.vocab_size    = h.vocab_size;
     c.n_heads       = h.n_heads;
     c.d_head        = h.d_head;
-    c.chunk_size    = h.chunk_size;
-    c.n_groups      = (h.n_groups == 0) ? 1u : h.n_groups;  // pre-Phase-11 files
-    c.default_dtype = static_cast<DType>(h.default_dtype);
+    c.chunk_size       = h.chunk_size;
+    c.n_groups         = (h.n_groups == 0) ? 1u : h.n_groups;  // pre-Phase-11 files
+    c.norm_before_gate = (h.norm_before_gate != 0);            // pre-Phase-16 → false
+    c.default_dtype    = static_cast<DType>(h.default_dtype);
     return c;
 }
 

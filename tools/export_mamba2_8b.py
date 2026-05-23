@@ -113,6 +113,7 @@ def _hparams_from_config(cfg) -> fmt.Mamba2Hparams:
     d_head     = g("head_dim", "d_head")
     chunk_size = g("chunk_size",                                default=256)
     n_groups   = g("n_groups", "num_groups", "ssm_n_groups",   default=1)
+    norm_before_gate = bool(g("norm_before_gate",              default=False))
 
     if n_heads is None and d_head is not None:
         n_heads = (expand * d_model) // d_head
@@ -127,6 +128,7 @@ def _hparams_from_config(cfg) -> fmt.Mamba2Hparams:
         d_conv=int(d_conv), expand=int(expand), vocab_size=int(vocab),
         n_heads=int(n_heads), d_head=int(d_head), chunk_size=int(chunk_size),
         n_groups=int(n_groups),
+        norm_before_gate=1 if norm_before_gate else 0,
         default_dtype=fmt.DTYPE_F16,
     )
 

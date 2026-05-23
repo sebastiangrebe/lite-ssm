@@ -466,6 +466,20 @@ void MetalOps::causal_conv1d_f16(MetalBufferHandle x,    std::size_t x_off,
     });
 }
 
+void MetalOps::seed_conv_state_f16(MetalBufferHandle xBC,   std::size_t xBC_off,
+                                   MetalBufferHandle state, std::size_t state_off,
+                                   uint32_t L, uint32_t D, uint32_t K) {
+    struct Params { uint32_t B, L, D, K; } p{1u, L, D, K};
+    run("seed_conv_state_f16", [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso) {
+        (void)pso;
+        bind_buf(enc, xBC,   xBC_off,   0);
+        bind_buf(enc, state, state_off, 1);
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(D, K, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    });
+}
+
 void MetalOps::causal_conv1d_update_f16(MetalBufferHandle x_new, std::size_t x_off,
                                         MetalBufferHandle state, std::size_t state_off,
                                         MetalBufferHandle w,     std::size_t w_off,
