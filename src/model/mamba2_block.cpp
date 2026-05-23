@@ -89,16 +89,13 @@ void Mamba2Model::run_block(MetalOps& ops,
     // ------------------------------------------------------------------
     // 2. Three in_proj matmuls -> proj_z, proj_xBC, proj_dt
     //
-    // Phase 14 — the in_proj weight may be FP16 or INT4_BLOCK32. The three
-    // slices share the SAME packing scheme (we either pack the whole row
-    // range at quantize time or none of it), so a single dtype check picks
-    // the pipeline for all three matmuls. Per int4 layout:
-    //   packed nibbles start at in_proj_w.offset_bytes
-    //   scales start at offset + (N_total * K / 2)
-    // and each slice has its own row sub-range. The scale region for slice
-    // [row0, row1) starts at scales_base + row0 * (K/32) * 2.
+    // Phase 20 — if the in_proj weight is FP16, the prefill path (L > 1)
+    // dispatches the fused `inproj_fused_f16` mega-kernel that wraps the
+    // three matmuls + conv1d + silu_split in a single GPU launch. Decode
+    // (L == 1) and int4-quantized paths still use the per-op kernels.
     // ------------------------------------------------------------------
     const bool ip_int4 = (bw.in_proj_w.dtype == DTYPE_INT4_B32);
+    const bool use_fused_prefill = !decode && L > 1 && L <= 16 && !ip_int4;
     const uint32_t ip_total_N = static_cast<uint32_t>(bw.in_proj_w.shape[0]);
     const std::size_t ip_scales_base = bw.in_proj_w.offset_bytes
                                      + std::size_t(ip_total_N) * (d_model / 2);
@@ -130,43 +127,55 @@ void Mamba2Model::run_block(MetalOps& ops,
             }
         }
     };
-    linear_in_proj(0,                       d_inner, wsl.normed_off, wsl.proj_z_off);
-    linear_in_proj(d_inner,                 xBC_dim, wsl.normed_off, wsl.proj_xBC_off);
-    linear_in_proj(d_inner + xBC_dim,       n_heads, wsl.normed_off, wsl.proj_dt_off);
-
-    // ------------------------------------------------------------------
-    // 3. Conv1D over proj_xBC -> conv_out  (PREFILL or DECODE-update)
-    //
-    // For PREFILL we ALSO need to seed the conv state with the LAST d_conv
-    // pre-conv samples so a subsequent decode picks up where we left off.
-    // The seed is done CPU-side after the encoder is committed (we use the
-    // mmap'd unified memory so the bytes are simultaneously visible).
-    // ------------------------------------------------------------------
-    if (decode || L == 1) {
-        ops.causal_conv1d_update_f16(
-            WS, wsl.proj_xBC_off,
-            ST, state.conv_state_offset(layer_idx),
-            W,  bw.conv1d_w.offset_bytes,
-            W,  bw.conv1d_b.offset_bytes,
-            WS, wsl.conv_out_off,
-            {1u, 1u, xBC_dim, d_conv});
+    if (use_fused_prefill) {
+        // Phase 20 — one mega-kernel writes proj_z, ssd_x, ssd_B, ssd_C,
+        // proj_dt directly. Replaces the 3 matmul + conv1d + split_silu
+        // chain (5 dispatches) with a single launch.
+        const uint32_t proj_dim = d_inner + xBC_dim + n_heads;
+        MetalOps::FusedInProjDims fdims{
+            L, d_model, d_inner, d_state, n_groups, n_heads, d_conv, proj_dim
+        };
+        ops.inproj_fused_f16(WS, wsl.normed_off,
+                             W,  bw.in_proj_w.offset_bytes,
+                             W,  bw.conv1d_w.offset_bytes,
+                             W,  bw.conv1d_b.offset_bytes,
+                             WS, wsl.proj_z_off,
+                             WS, wsl.ssd_x_off,
+                             WS, wsl.ssd_B_off,
+                             WS, wsl.ssd_C_off,
+                             WS, wsl.proj_dt_off,
+                             WS, wsl.proj_xBC_off,
+                             fdims);
     } else {
-        ops.causal_conv1d_f16(
-            WS, wsl.proj_xBC_off,
-            W,  bw.conv1d_w.offset_bytes,
-            W,  bw.conv1d_b.offset_bytes,
-            WS, wsl.conv_out_off,
-            {1u, L, xBC_dim, d_conv});
-    }
+        linear_in_proj(0,                       d_inner, wsl.normed_off, wsl.proj_z_off);
+        linear_in_proj(d_inner,                 xBC_dim, wsl.normed_off, wsl.proj_xBC_off);
+        linear_in_proj(d_inner + xBC_dim,       n_heads, wsl.normed_off, wsl.proj_dt_off);
 
-    // ------------------------------------------------------------------
-    // 4. SiLU + split: conv_out -> ssd_x, ssd_B, ssd_C
-    // ------------------------------------------------------------------
-    ops.split_silu_xBC_f16(WS, wsl.conv_out_off,
-                           WS, wsl.ssd_x_off,
-                           WS, wsl.ssd_B_off,
-                           WS, wsl.ssd_C_off,
-                           L, d_inner, d_state, n_groups);
+        // ----- Conv1D over proj_xBC -> conv_out (per-op path) -----
+        if (decode || L == 1) {
+            ops.causal_conv1d_update_f16(
+                WS, wsl.proj_xBC_off,
+                ST, state.conv_state_offset(layer_idx),
+                W,  bw.conv1d_w.offset_bytes,
+                W,  bw.conv1d_b.offset_bytes,
+                WS, wsl.conv_out_off,
+                {1u, 1u, xBC_dim, d_conv});
+        } else {
+            ops.causal_conv1d_f16(
+                WS, wsl.proj_xBC_off,
+                W,  bw.conv1d_w.offset_bytes,
+                W,  bw.conv1d_b.offset_bytes,
+                WS, wsl.conv_out_off,
+                {1u, L, xBC_dim, d_conv});
+        }
+
+        // ----- SiLU + split: conv_out -> ssd_x, ssd_B, ssd_C -----
+        ops.split_silu_xBC_f16(WS, wsl.conv_out_off,
+                               WS, wsl.ssd_x_off,
+                               WS, wsl.ssd_B_off,
+                               WS, wsl.ssd_C_off,
+                               L, d_inner, d_state, n_groups);
+    }
 
     // ------------------------------------------------------------------
     // 5. SSD (prefill = chunked / decode = single fused step)

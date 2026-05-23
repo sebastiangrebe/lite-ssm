@@ -186,6 +186,7 @@ target_link_libraries(lite_ssm
         Metal::Metal
         Metal::Foundation
         Metal::QuartzCore
+        Metal::MPS
     PRIVATE
         sentencepiece-static
 )

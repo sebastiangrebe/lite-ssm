@@ -187,6 +187,31 @@ public:
                              MetalBufferHandle state, std::size_t state_off,
                              uint32_t L, uint32_t D, uint32_t K);
 
+    // Phase 20 — fused in_proj + conv1d + silu_split for the prefill
+    // pipeline. Replaces 5 separate dispatches with one. Requires L ≤ 16
+    // (single chunk in time). normed_off points at the RMSNorm-output slot.
+    struct FusedInProjDims {
+        uint32_t L;
+        uint32_t d_model;
+        uint32_t d_inner;
+        uint32_t d_state;
+        uint32_t n_groups;
+        uint32_t n_heads;
+        uint32_t d_conv;
+        uint32_t proj_dim;     // d_inner + xBC_dim + n_heads
+    };
+    void inproj_fused_f16(MetalBufferHandle normed,   std::size_t normed_off,
+                          MetalBufferHandle W_in,     std::size_t w_in_off,
+                          MetalBufferHandle W_conv,   std::size_t w_conv_off,
+                          MetalBufferHandle conv_b,   std::size_t conv_b_off,
+                          MetalBufferHandle proj_z,   std::size_t z_off,
+                          MetalBufferHandle ssd_x,    std::size_t x_off,
+                          MetalBufferHandle ssd_B,    std::size_t b_off,
+                          MetalBufferHandle ssd_C,    std::size_t c_off,
+                          MetalBufferHandle proj_dt,  std::size_t dt_off,
+                          MetalBufferHandle proj_xBC, std::size_t xBC_off,
+                          FusedInProjDims dims);
+
     void ssd_chunked_f16(MetalBufferHandle X,        std::size_t X_off,
                          MetalBufferHandle B,        std::size_t B_off,
                          MetalBufferHandle C,        std::size_t C_off,

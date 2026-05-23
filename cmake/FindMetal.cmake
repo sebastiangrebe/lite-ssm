@@ -10,6 +10,7 @@ endif()
 find_library(METAL_FRAMEWORK Metal)
 find_library(FOUNDATION_FRAMEWORK Foundation)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore)
+find_library(METALPERFORMANCESHADERS_FRAMEWORK MetalPerformanceShaders)
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(Metal
@@ -17,6 +18,7 @@ find_package_handle_standard_args(Metal
         METAL_FRAMEWORK
         FOUNDATION_FRAMEWORK
         QUARTZCORE_FRAMEWORK
+        METALPERFORMANCESHADERS_FRAMEWORK
 )
 
 if(Metal_FOUND)
@@ -38,6 +40,13 @@ if(Metal_FOUND)
             INTERFACE_LINK_LIBRARIES "${QUARTZCORE_FRAMEWORK}"
         )
     endif()
+    if(NOT TARGET Metal::MPS)
+        add_library(Metal::MPS INTERFACE IMPORTED)
+        set_target_properties(Metal::MPS PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${METALPERFORMANCESHADERS_FRAMEWORK}"
+        )
+    endif()
 endif()
 
-mark_as_advanced(METAL_FRAMEWORK FOUNDATION_FRAMEWORK QUARTZCORE_FRAMEWORK)
+mark_as_advanced(METAL_FRAMEWORK FOUNDATION_FRAMEWORK QUARTZCORE_FRAMEWORK
+                 METALPERFORMANCESHADERS_FRAMEWORK)

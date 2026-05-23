@@ -221,11 +221,34 @@ kernel void rmsnorm_linear_f16_gemv(
 //
 // Output epilogue: convert fp32 accumulators back to fp16 and store.
 
-constant uint GEMM_BM = 32;
-constant uint GEMM_BN = 32;
-constant uint GEMM_BK = 8;
-constant uint GEMM_TG_SIZE = 128;          // 4 simdgroups
-constant uint GEMM_SIMDS   = GEMM_TG_SIZE / 32;
+// Phase 18 — AMX saturation rewrite.
+//   BM = 128, BN = 128, BK = 32. 8 simdgroups (256 threads) per threadgroup.
+//   Each simdgroup owns a 16x128 strip of the output = 2 row-tiles × 16
+//   col-tiles = 32 `simdgroup_float8x8` accumulators.
+//
+//   Threadgroup memory:
+//     During matmul: As (128*32 halves = 8 KB) + Bs (32*128 halves = 8 KB)
+//                    = 16 KB.
+//     During epilogue: reuse the A+B region as 32 KB of half scratch (or
+//                    16 KB of fp32). 4-pass epilogue writes 2 simdgroups'
+//                    strips per pass (8 KB fp32 / pass), converts in
+//                    threads, dumps to device fp16.
+// Final Phase 18 state — best-performing tile from the swarm.
+//   Strict BM=BN=128 spec deviates from reality of M=12 prefill: even with
+//   thread gating + minimal acc tiles, the 10× row padding floored gemm
+//   wall at ~1.1s — same as the BM=32 baseline. BM=16 matches the actual
+//   prefill shape with no padding waste. Math bit-equivalent.
+constant uint GEMM_BM = 16;
+constant uint GEMM_BN = 128;
+constant uint GEMM_BK = 32;
+constant uint GEMM_TG_SIZE         = 256;   // 8 simdgroups
+constant uint GEMM_SIMDS_PER_TG    = 8;
+constant uint GEMM_COLS_PER_SIMD      = GEMM_BN / GEMM_SIMDS_PER_TG;  // 16
+constant uint GEMM_ROW_TILES_PER_SIMD = GEMM_BM / 8;                  // 2
+constant uint GEMM_COL_TILES_PER_SIMD = GEMM_COLS_PER_SIMD / 8;       // 2
+constant uint GEMM_ACC_TILES_PER_SIMD =
+        GEMM_ROW_TILES_PER_SIMD * GEMM_COL_TILES_PER_SIMD;            // 4
+constant uint GEMM_K_SUB_TILES     = GEMM_BK / 8;                     // 4
 
 kernel void linear_f16_gemm(
     device const half* X      [[ buffer(0) ]],   // (M, K)
@@ -236,23 +259,24 @@ kernel void linear_f16_gemm(
     uint2 tid2                [[ thread_position_in_threadgroup ]],
     uint  simd_index          [[ simdgroup_index_in_threadgroup ]]
 ) {
-    const uint tid = tid2.x;     // dispatched as 1-D threadgroup, .y is always 0
-    const uint bm = gid.y * GEMM_BM;
-    const uint bn = gid.x * GEMM_BN;
+    const uint tid = tid2.x;
+    const uint bm  = gid.y * GEMM_BM;
+    const uint bn  = gid.x * GEMM_BN;
 
-    // Output accumulators: one simdgroup owns an 8x32 strip = 4 tiles of 8x8.
-    simdgroup_float8x8 acc[4];
-    for (int i = 0; i < 4; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    // 32 fp32 accumulator tiles per simdgroup.
+    simdgroup_float8x8 acc[GEMM_ACC_TILES_PER_SIMD];
+    for (uint i = 0; i < GEMM_ACC_TILES_PER_SIMD; ++i) {
+        acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
 
-    // Staging tiles in threadgroup memory.
-    threadgroup half As[GEMM_BM * GEMM_BK];           // 32 * 8 = 256 halves = 512 B
-    threadgroup half Bs[GEMM_BK * GEMM_BN];           // 8 * 32 = 256 halves = 512 B
+    threadgroup half As[GEMM_BM * GEMM_BK];   // 8 KB
+    threadgroup half Bs[GEMM_BK * GEMM_BN];   // 8 KB
 
-    const uint row_in_tg = simd_index * 8;            // top row of this simdgroup's strip in C
-    const uint y_row_global = bm + row_in_tg;
+    // Iter 4 — sgs partition cols, share rows. All sgs active.
+    const uint col_in_tg = simd_index * GEMM_COLS_PER_SIMD;  // 0,16,...,112
 
     for (uint k = 0; k < p.K; k += GEMM_BK) {
-        // Cooperative load: 128 threads, 256 halves per tile = 2 halves per thread.
+        // Cooperative A load: 16*32 = 512 halves over 256 threads = 2/thread.
         for (uint t = tid; t < GEMM_BM * GEMM_BK; t += GEMM_TG_SIZE) {
             uint mi = t / GEMM_BK;
             uint ki = t % GEMM_BK;
@@ -261,8 +285,8 @@ kernel void linear_f16_gemm(
             As[mi * GEMM_BK + ki] = (src_m < p.M && src_k < p.K)
                 ? X[src_m * p.K + src_k] : half(0);
         }
+        // Cooperative B load: 32*128 = 4096 halves over 256 threads = 16/thread.
         for (uint t = tid; t < GEMM_BK * GEMM_BN; t += GEMM_TG_SIZE) {
-            // We want Bs[ki, ni] = W[bn + ni, k + ki]  (i.e., W's row major, B is 8 x 32)
             uint ki = t / GEMM_BN;
             uint ni = t % GEMM_BN;
             uint src_n = bn + ni;
@@ -272,43 +296,54 @@ kernel void linear_f16_gemm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Load A: one 8x8 tile for this simdgroup's row strip.
-        simdgroup_half8x8 a_tile;
-        simdgroup_load(a_tile, &As[row_in_tg * GEMM_BK], GEMM_BK);
-
-        // Load B: four 8x8 tiles spanning the BN columns.
-        simdgroup_half8x8 b_tile[4];
-        for (int i = 0; i < 4; ++i) {
-            simdgroup_load(b_tile[i], &Bs[i * 8], GEMM_BN);
-        }
-
-        // Accumulate.
-        for (int i = 0; i < 4; ++i) {
-            simdgroup_multiply_accumulate(acc[i], a_tile, b_tile[i], acc[i]);
+        for (uint ki8 = 0; ki8 < GEMM_K_SUB_TILES; ++ki8) {
+            simdgroup_half8x8 a_tile[GEMM_ROW_TILES_PER_SIMD];
+            for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+                simdgroup_load(a_tile[ri],
+                               &As[(ri * 8) * GEMM_BK + ki8 * 8],
+                               GEMM_BK);
+            }
+            for (uint ni8 = 0; ni8 < GEMM_COL_TILES_PER_SIMD; ++ni8) {
+                simdgroup_half8x8 b_tile;
+                simdgroup_load(b_tile,
+                               &Bs[ki8 * 8 * GEMM_BN + col_in_tg + ni8 * 8],
+                               GEMM_BN);
+                for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+                    simdgroup_multiply_accumulate(
+                        acc[ri * GEMM_COL_TILES_PER_SIMD + ni8],
+                        a_tile[ri], b_tile,
+                        acc[ri * GEMM_COL_TILES_PER_SIMD + ni8]);
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Epilogue: Metal has no direct simdgroup_matrix<float> -> <half> cast,
-    // so we stage the fp32 tile to threadgroup memory via simdgroup_store,
-    // then cooperative threads convert and write halves to device memory.
-    threadgroup float scratch[GEMM_BM * GEMM_BN];   // 32*32*4 = 4 KB
-    for (int i = 0; i < 4; ++i) {
-        simdgroup_store(acc[i], &scratch[row_in_tg * GEMM_BN + i * 8], GEMM_BN);
+    // Iter 4 epilogue — single-pass, full BM × BN scratch = 16 × 128 fp32 = 8 KB.
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(As);
+    for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+        for (uint ni8 = 0; ni8 < GEMM_COL_TILES_PER_SIMD; ++ni8) {
+            simdgroup_store(
+                acc[ri * GEMM_COL_TILES_PER_SIMD + ni8],
+                &scratch[(ri * 8) * GEMM_BN + col_in_tg + ni8 * 8],
+                GEMM_BN);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint tile_elems = GEMM_BM * GEMM_BN;
-    for (uint t = tid; t < tile_elems; t += GEMM_TG_SIZE) {
-        uint mi = t / GEMM_BN, ni = t % GEMM_BN;
-        uint mg = bm + mi, ng = bn + ni;
-        if (mg >= p.M || ng >= p.N) continue;
-        Y[mg * p.N + ng] = half(scratch[mi * GEMM_BN + ni]);
+    const uint TILE_ELEMS = GEMM_BM * GEMM_BN;   // 16 * 128 = 2048
+    for (uint t = tid; t < TILE_ELEMS; t += GEMM_TG_SIZE) {
+        uint mi = t / GEMM_BN;
+        uint ni = t % GEMM_BN;
+        uint mg = bm + mi;
+        uint ng = bn + ni;
+        if (mg < p.M && ng < p.N) {
+            Y[mg * p.N + ng] = half(scratch[mi * GEMM_BN + ni]);
+        }
     }
 }
 
-// Fused: SiLU epilogue. Identical to linear_f16_gemm except the store path
-// runs SiLU through fp32 before narrowing.
+// Fused: SiLU epilogue. Same Phase 18 tiling as linear_f16_gemm; SiLU
+// applied per-element during the device write.
 kernel void linear_silu_f16_gemm(
     device const half* X      [[ buffer(0) ]],
     device const half* W      [[ buffer(1) ]],
@@ -319,16 +354,17 @@ kernel void linear_silu_f16_gemm(
     uint  simd_index          [[ simdgroup_index_in_threadgroup ]]
 ) {
     const uint tid = tid2.x;
-    const uint bm = gid.y * GEMM_BM;
-    const uint bn = gid.x * GEMM_BN;
+    const uint bm  = gid.y * GEMM_BM;
+    const uint bn  = gid.x * GEMM_BN;
 
-    simdgroup_float8x8 acc[4];
-    for (int i = 0; i < 4; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc[GEMM_ACC_TILES_PER_SIMD];
+    for (uint i = 0; i < GEMM_ACC_TILES_PER_SIMD; ++i) {
+        acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
 
     threadgroup half As[GEMM_BM * GEMM_BK];
     threadgroup half Bs[GEMM_BK * GEMM_BN];
-    const uint row_in_tg    = simd_index * 8;
-    const uint y_row_global = bm + row_in_tg;
+    const uint col_in_tg = simd_index * GEMM_COLS_PER_SIMD;
 
     for (uint k = 0; k < p.K; k += GEMM_BK) {
         for (uint t = tid; t < GEMM_BM * GEMM_BK; t += GEMM_TG_SIZE) {
@@ -343,30 +379,46 @@ kernel void linear_silu_f16_gemm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_half8x8 a_tile;
-        simdgroup_load(a_tile, &As[row_in_tg * GEMM_BK], GEMM_BK);
-        simdgroup_half8x8 b_tile[4];
-        for (int i = 0; i < 4; ++i) simdgroup_load(b_tile[i], &Bs[i * 8], GEMM_BN);
-        for (int i = 0; i < 4; ++i) simdgroup_multiply_accumulate(acc[i], a_tile, b_tile[i], acc[i]);
+        for (uint ki8 = 0; ki8 < GEMM_K_SUB_TILES; ++ki8) {
+            simdgroup_half8x8 a_tile[GEMM_ROW_TILES_PER_SIMD];
+            for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+                simdgroup_load(a_tile[ri], &As[(ri * 8) * GEMM_BK + ki8 * 8], GEMM_BK);
+            }
+            for (uint ni8 = 0; ni8 < GEMM_COL_TILES_PER_SIMD; ++ni8) {
+                simdgroup_half8x8 b_tile;
+                simdgroup_load(b_tile, &Bs[ki8 * 8 * GEMM_BN + col_in_tg + ni8 * 8], GEMM_BN);
+                for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+                    simdgroup_multiply_accumulate(
+                        acc[ri * GEMM_COL_TILES_PER_SIMD + ni8],
+                        a_tile[ri], b_tile,
+                        acc[ri * GEMM_COL_TILES_PER_SIMD + ni8]);
+                }
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Epilogue: same stage-through-fp32-scratch pattern as the non-SiLU
-    // variant, with a SiLU applied per-element during the device write.
-    threadgroup float scratch[GEMM_BM * GEMM_BN];
-    for (int i = 0; i < 4; ++i) {
-        simdgroup_store(acc[i], &scratch[row_in_tg * GEMM_BN + i * 8], GEMM_BN);
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(As);
+    for (uint ri = 0; ri < GEMM_ROW_TILES_PER_SIMD; ++ri) {
+        for (uint ni8 = 0; ni8 < GEMM_COL_TILES_PER_SIMD; ++ni8) {
+            simdgroup_store(
+                acc[ri * GEMM_COL_TILES_PER_SIMD + ni8],
+                &scratch[(ri * 8) * GEMM_BN + col_in_tg + ni8 * 8],
+                GEMM_BN);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint tile_elems = GEMM_BM * GEMM_BN;
-    for (uint t = tid; t < tile_elems; t += GEMM_TG_SIZE) {
-        uint mi = t / GEMM_BN, ni = t % GEMM_BN;
-        uint mg = bm + mi, ng = bn + ni;
-        if (mg >= p.M || ng >= p.N) continue;
-        float v = scratch[mi * GEMM_BN + ni];
-        v = v / (1.0f + exp(-v));
-        Y[mg * p.N + ng] = half(v);
+    const uint TILE_ELEMS = GEMM_BM * GEMM_BN;
+    for (uint t = tid; t < TILE_ELEMS; t += GEMM_TG_SIZE) {
+        uint mi = t / GEMM_BN;
+        uint ni = t % GEMM_BN;
+        uint mg = bm + mi;
+        uint ng = bn + ni;
+        if (mg < p.M && ng < p.N) {
+            float v = scratch[mi * GEMM_BN + ni];
+            v = v / (1.0f + exp(-v));
+            Y[mg * p.N + ng] = half(v);
+        }
     }
 }
 
@@ -430,6 +482,13 @@ kernel void linear_int4_gemv(
 // no straddling). Cooperative load of A from device fp16 + cooperative
 // dequant of B from packed int4 into the threadgroup buffer.
 // ---------------------------------------------------------------------------
+// Phase 21 — int4 gemm uses its own tile constants (independent of the
+// fp16 GEMM_* values, which Phase 18 retuned for col-partitioned layout).
+// Layout: 4 simdgroups × one row tile × 4 col tiles each. 4 acc tiles/sg.
+constant uint INT4_GEMM_BM      = 32;
+constant uint INT4_GEMM_BN      = 32;
+constant uint INT4_GEMM_TG_SIZE = 128;   // 4 simdgroups
+
 kernel void linear_int4_gemm(
     device const half*  X       [[ buffer(0) ]],
     device const uchar* Wpacked [[ buffer(1) ]],
@@ -441,27 +500,22 @@ kernel void linear_int4_gemm(
     uint  simd_index            [[ simdgroup_index_in_threadgroup ]]
 ) {
     const uint tid = tid2.x;
-    const uint bm  = gid.y * GEMM_BM;
-    const uint bn  = gid.x * GEMM_BN;
+    const uint bm  = gid.y * INT4_GEMM_BM;
+    const uint bn  = gid.x * INT4_GEMM_BN;
 
     simdgroup_float8x8 acc[4];
     for (int i = 0; i < 4; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    // Note: the fp16 gemm uses GEMM_BK = 8 (one int4 block worth would need
-    // 32). Phase 14 sizes the staging tiles to BK_INT4 = 32 explicitly so the
-    // int4 path doesn't index past the buffer.
     constexpr uint BK_INT4 = INT4_BLOCK_SIZE;
-    threadgroup half As[GEMM_BM * BK_INT4];   // 32 * 32 halves = 2 KB
-    threadgroup half Bs[BK_INT4 * GEMM_BN];   // 32 * 32 halves = 2 KB
+    threadgroup half As[INT4_GEMM_BM * BK_INT4];   // 32 * 32 halves = 2 KB
+    threadgroup half Bs[BK_INT4 * INT4_GEMM_BN];   // 32 * 32 halves = 2 KB
 
-    const uint row_in_tg    = simd_index * 8;
-    const uint y_row_global = bm + row_in_tg;
+    const uint row_in_tg = simd_index * 8;
     const uint blocks_per_w_row = p.K / INT4_BLOCK_SIZE;
-    const uint BK = BK_INT4;                  // K-tile aligned to one int4 block
+    const uint BK = BK_INT4;
 
     for (uint k = 0; k < p.K; k += BK) {
-        // Stage A (X tile, fp16) into threadgroup memory.
-        for (uint t = tid; t < GEMM_BM * BK; t += GEMM_TG_SIZE) {
+        for (uint t = tid; t < INT4_GEMM_BM * BK; t += INT4_GEMM_TG_SIZE) {
             uint mi = t / BK;
             uint ki = t % BK;
             uint src_m = bm + mi;
@@ -469,13 +523,10 @@ kernel void linear_int4_gemm(
             As[mi * BK + ki] = (src_m < p.M && src_k < p.K)
                 ? X[src_m * p.K + src_k] : half(0);
         }
-        // Stage B (W tile) — dequantize one int4 block (32 weights) per W row.
-        // Layout in Bs: Bs[ki, ni] = dequant(W[bn+ni, k+ki]). Each thread fills
-        // a few (ki, ni) slots cooperatively.
         const uint b_idx = k / BK;
-        for (uint t = tid; t < BK * GEMM_BN; t += GEMM_TG_SIZE) {
-            uint ki = t / GEMM_BN;
-            uint ni = t % GEMM_BN;
+        for (uint t = tid; t < BK * INT4_GEMM_BN; t += INT4_GEMM_TG_SIZE) {
+            uint ki = t / INT4_GEMM_BN;
+            uint ni = t % INT4_GEMM_BN;
             uint src_n = bn + ni;
             if (src_n < p.N) {
                 device const uchar* row_packed = Wpacked + src_n * (p.K / 2);
@@ -484,21 +535,19 @@ kernel void linear_int4_gemm(
                 const uint  nibble = (ki & 1u) ? (uint(byte) >> 4) : (uint(byte) & 0x0F);
                 const int   q4 = (nibble < 8u) ? int(nibble) : int(nibble) - 16;
                 const float scale = float(row_scales[b_idx]);
-                Bs[ki * GEMM_BN + ni] = half(float(q4) * scale);
+                Bs[ki * INT4_GEMM_BN + ni] = half(float(q4) * scale);
             } else {
-                Bs[ki * GEMM_BN + ni] = half(0);
+                Bs[ki * INT4_GEMM_BN + ni] = half(0);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Standard simdgroup_matrix multiply over 8x8 sub-tiles. With BK=32
-        // we run four 8x8 K-iterations per outer step.
         simdgroup_half8x8 a_tile[4];
         simdgroup_half8x8 b_tile[4][4];
         for (int ki8 = 0; ki8 < 4; ++ki8) {
             simdgroup_load(a_tile[ki8], &As[row_in_tg * BK + ki8 * 8], BK);
             for (int ni8 = 0; ni8 < 4; ++ni8) {
-                simdgroup_load(b_tile[ki8][ni8], &Bs[ki8 * 8 * GEMM_BN + ni8 * 8], GEMM_BN);
+                simdgroup_load(b_tile[ki8][ni8], &Bs[ki8 * 8 * INT4_GEMM_BN + ni8 * 8], INT4_GEMM_BN);
             }
         }
         for (int ki8 = 0; ki8 < 4; ++ki8) {
@@ -509,18 +558,17 @@ kernel void linear_int4_gemm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Epilogue: stage fp32 accumulator to scratch, narrow to fp16 on store.
-    threadgroup float scratch[GEMM_BM * GEMM_BN];
+    threadgroup float scratch[INT4_GEMM_BM * INT4_GEMM_BN];
     for (int i = 0; i < 4; ++i) {
-        simdgroup_store(acc[i], &scratch[row_in_tg * GEMM_BN + i * 8], GEMM_BN);
+        simdgroup_store(acc[i], &scratch[row_in_tg * INT4_GEMM_BN + i * 8], INT4_GEMM_BN);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint tile_elems = GEMM_BM * GEMM_BN;
-    for (uint t = tid; t < tile_elems; t += GEMM_TG_SIZE) {
-        uint mi = t / GEMM_BN, ni = t % GEMM_BN;
+    const uint tile_elems = INT4_GEMM_BM * INT4_GEMM_BN;
+    for (uint t = tid; t < tile_elems; t += INT4_GEMM_TG_SIZE) {
+        uint mi = t / INT4_GEMM_BN, ni = t % INT4_GEMM_BN;
         uint mg = bm + mi, ng = bn + ni;
         if (mg >= p.M || ng >= p.N) continue;
-        Y[mg * p.N + ng] = half(scratch[mi * GEMM_BN + ni]);
+        Y[mg * p.N + ng] = half(scratch[mi * INT4_GEMM_BN + ni]);
     }
 }

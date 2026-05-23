@@ -28,7 +28,7 @@ int main() {
     }
     std::printf("[test_metal_ops] metallib: %s\n", ops.metallib_path().c_str());
 
-    constexpr std::array<std::string_view, 16> kernels = {
+    constexpr std::array<std::string_view, 17> kernels = {
         "lite_ssm_common_noop",
         "rmsnorm_f16",
         "silu_f16",
@@ -45,6 +45,7 @@ int main() {
         "linear_int4_gemv",      // Phase 14
         "linear_int4_gemm",
         "seed_conv_state_f16",   // Phase 16
+        "inproj_fused_f16",      // Phase 20
     };
 
     int failures = 0;

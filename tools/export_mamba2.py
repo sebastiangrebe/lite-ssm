@@ -57,10 +57,11 @@ def is_int4_quantizable(name: str, shape) -> bool:
         return False
     if shape[-1] % fmt.INT4_BLOCK_SIZE != 0:
         return False
+    # Phase 21 — strictly only the two big projection matrices. lm_head must
+    # stay fp16: a 4-bit final vocab projection blows up logit KL (>10 nats).
     return (
         name.endswith(".in_proj.weight") or
-        name.endswith(".out_proj.weight") or
-        name == "lm_head.weight"
+        name.endswith(".out_proj.weight")
     )
 
 

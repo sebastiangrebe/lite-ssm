@@ -12,6 +12,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include "lite_ssm/ops.hpp"
 #include "lite_ssm/detail/metal_backend.hpp"
@@ -281,15 +282,13 @@ void dispatch_gemm(MetalOps::Impl* impl, const char* kernel_name,
                    MetalBufferHandle y, std::size_t y_off,
                    LinearDims dims) {
     struct Params { uint32_t M, N, K; } p{dims.M, dims.N, dims.K};
-
     run_impl(impl, kernel_name, [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso) {
         (void)pso;
         bind_buf(enc, x, x_off, 0);
         bind_buf(enc, w, w_off, 1);
         bind_buf(enc, y, y_off, 2);
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-
-        const NSUInteger BM = 32, BN = 32, TG = 128;
+        const NSUInteger BM = 16, BN = 128, TG = 256;   // Phase 18 final (post-MPS revert)
         const NSUInteger gx = (dims.N + BN - 1) / BN;
         const NSUInteger gy = (dims.M + BM - 1) / BM;
         [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
@@ -500,6 +499,46 @@ void MetalOps::causal_conv1d_update_f16(MetalBufferHandle x_new, std::size_t x_o
         const NSUInteger tg = 64;
         [enc dispatchThreads:MTLSizeMake(dims.D, dims.B, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    });
+}
+
+// ---------------------------------------------------------------------------
+//  Phase 20 — Fused in_proj + conv1d + silu_split
+// ---------------------------------------------------------------------------
+void MetalOps::inproj_fused_f16(MetalBufferHandle normed,   std::size_t normed_off,
+                                MetalBufferHandle W_in,     std::size_t w_in_off,
+                                MetalBufferHandle W_conv,   std::size_t w_conv_off,
+                                MetalBufferHandle conv_b,   std::size_t conv_b_off,
+                                MetalBufferHandle proj_z,   std::size_t z_off,
+                                MetalBufferHandle ssd_x,    std::size_t x_off,
+                                MetalBufferHandle ssd_B,    std::size_t b_off,
+                                MetalBufferHandle ssd_C,    std::size_t c_off,
+                                MetalBufferHandle proj_dt,  std::size_t dt_off,
+                                MetalBufferHandle proj_xBC, std::size_t xBC_off,
+                                FusedInProjDims dims) {
+    struct Params {
+        uint32_t L, d_model, d_inner, d_state, n_groups, n_heads, d_conv, proj_dim;
+    } p{dims.L, dims.d_model, dims.d_inner, dims.d_state, dims.n_groups,
+        dims.n_heads, dims.d_conv, dims.proj_dim};
+
+    run("inproj_fused_f16", [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso) {
+        (void)pso;
+        bind_buf(enc, normed,   normed_off, 0);
+        bind_buf(enc, W_in,     w_in_off,   1);
+        bind_buf(enc, W_conv,   w_conv_off, 2);
+        bind_buf(enc, conv_b,   conv_b_off, 3);
+        bind_buf(enc, proj_z,   z_off,      4);
+        bind_buf(enc, ssd_x,    x_off,      5);
+        bind_buf(enc, ssd_B,    b_off,      6);
+        bind_buf(enc, ssd_C,    c_off,      7);
+        bind_buf(enc, proj_dt,  dt_off,     8);
+        [enc setBytes:&p length:sizeof(p) atIndex:9];
+        bind_buf(enc, proj_xBC, xBC_off,    10);
+
+        const NSUInteger TILE_N = 32, TG = 256;
+        const NSUInteger groups = (dims.proj_dim + TILE_N - 1) / TILE_N;
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
     });
 }
 
